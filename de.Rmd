@@ -1,0 +1,944 @@
+---
+params: 
+  title: ""
+  publication_date: ""
+  doi: ""
+  year_in_title: "April 2022"
+  recent_calls: ["Oktober 2021", "April 2022"]
+  up_to_date: ["2022-05-01"]
+  since: ["2013-10-01"]
+  research_area: "all"
+  confounders_odds_ssh: ["InstType", "FirstProject", "scale_age"]
+  confounders_odds_mint: ["InstType", "FirstProject", "scale_age"]
+  confounders_odds_ls: ["InstType", "FirstProject", "scale_age"]
+output: 
+  html_document:
+    anchor_sections: false
+    theme: null
+    highlight: null
+    mathjax: null
+    css: ["style.css", "https://fonts.googleapis.com/css?family=Source+Sans+Pro:400,700&display=swap"]
+    self_contained: true
+title: "`r params$title`"
+---
+
+
+```{r general-setup, include=FALSE}
+## This file contains the GERMAN version of the data story
+
+# Set general chunk options
+knitr::opts_chunk$set(echo = FALSE, fig.showtext = TRUE, fig.retina = 3, 
+                      fig.align = "center", warning = FALSE, message = FALSE)
+
+
+# Install snf.datastory package if not available, otherwise load it
+if (!require("snf.datastory")) {
+  if (!require("devtools")) {
+    install.packages("devtools")
+    library(devtools)
+  }
+  install_github("snsf-data/snf.datastory")
+  library(snf.datastory)
+}
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(conflicted)
+library(jsonlite)
+library(here)
+library(ggiraph)
+library(readr)
+library(kableExtra)
+library(stringi)
+library(lme4)
+library(splines)
+library(glue)
+
+# Conflict preferences
+conflict_prefer("filter", "dplyr")
+conflict_prefer("get_datastory_theme", "snf.datastory")
+conflict_prefer("get_datastory_scheme", "snf.datastory")
+
+# Increase showtext package font resolution
+showtext_opts(dpi = 320)
+
+# Set the locale for date formatting (Windows)
+Sys.setlocale("LC_TIME", "German")
+
+# Create function to print number with local language-specific format 
+print_num <- function(x) snf.datastory::print_num(x, lang = "de")
+
+# Knitr hook for local formatting of printed numbers
+knitr::knit_hooks$set(
+  inline <- function(x) {
+    if (!is.numeric(x)) {
+      x
+    } else {
+      print_num(x)
+    }
+  }
+)
+```
+
+```{r print-header-infos, results='asis'}
+# Add publication date to header
+cat(format(as_datetime(params$publication_date), "%d.%m.%Y"))
+```
+
+```{r story-specific-setup, include=FALSE, message=FALSE}
+# Init local variables with params
+recent_calls <- params$recent_calls
+up_to_date <- params$up_to_date
+since <- params$since
+research_area <- params$research_area
+confounders_odds_ssh <- params$confounders_odds_ssh
+confounders_odds_mint <- params$confounders_odds_mint
+confounders_odds_ls <- params$confounders_odds_ls
+confounders_odds <- unique(c(
+  confounders_odds_ls,
+  confounders_odds_ssh,
+  confounders_odds_mint
+))
+
+# Load data required to calculate the models
+data_gm_up_to_year_of_interest <- 
+  read_csv("data_gm_up_to_year_of_interest_oct22.csv") %>%
+  # Lang-specific recoding & orderings
+  mutate(
+    Call = str_replace_all(Call, "October", "Oktober"), 
+    # Call = str_replace_all(Call, "April", "April"), 
+    # Switch the order of the year and month name for de/fr
+    Call = map_chr(Call, function(x) {
+      x %>% 
+        str_split(" ") %>% 
+        unlist() %>% 
+        rev() %>% 
+        paste0(collapse = " ")
+    }), 
+    InstType = case_when(
+      InstType == "ETH" ~ "ETH-Bereich", 
+      InstType == "Cantonal universities" ~ "Kantonale Universitäten", 
+      InstType == "UAS/UTE" ~ "FH/PH", 
+      InstType == "Other" ~ "Weitere", 
+      TRUE ~ "UNKNOWN"
+    ), 
+    InstType = fct_relevel(InstType, c(
+      "Kantonale Universitäten", "ETH-Bereich", "FH/PH", "Weitere"
+    )),
+    Division = translate_research_area(Division, target_lang = "de"), 
+    Division = fct_relevel(Division, c("Insgesamt", "GSW", "MINT", "LW"))
+  ) 
+
+# We run the statistical model first on the x latest calls:
+data_recent <- data_gm_up_to_year_of_interest %>%
+  filter(grepl(paste(recent_calls, collapse = "|"), Call)) %>%
+  droplevels()
+
+switch_order <- function(str) {
+  idx_month <- seq(2, (length(str) * 2), by = 2)
+  idx_year <- seq(1, (length(str) * 2), by = 2)
+  str_month <- unlist(str_split(str, " "))[idx_month]
+  str_year <- unlist(str_split(str, " "))[idx_year]
+  paste0(str_month, " ", str_year)
+}
+
+call_names <- data_gm_up_to_year_of_interest %>%
+  count(Call) %>%
+  pull(Call) %>%
+  switch_order()
+
+# Calculate the number of submissions per Year / per Call
+nb_application_by_year <- data_gm_up_to_year_of_interest %>%
+  group_by(year(CallEndDate)) %>%
+  summarise("Total number of submissions" = n()) %>%
+  rename("Call Year" = `year(CallEndDate)`) %>%
+  ungroup()
+
+nb_application_by_call <- data_gm_up_to_year_of_interest %>%
+  group_by(Call) %>%
+  summarise("Total number of submissions" = n()) %>%
+  ungroup()
+
+plot_by_division <- function(div, limits = c(0.18, .87),
+                             title = NULL, xlab = NULL, ylab = NULL,
+                             inverse_gender = FALSE, allpooled = allpooled,
+                             add_overall = FALSE) {
+  # Subset division when required
+  if (div != "all") {
+    toplot <- toplot %>%
+      filter(Division == div)
+  }
+  
+  # When one plot "Overall" should be added
+  if (add_overall) {
+    toplot <- toplot %>%
+      bind_rows(allpooled %>%
+                  mutate(Division = "Insgesamt")) %>% 
+      mutate(Division = fct_relevel(Division, 
+                                    c("Insgesamt", "GSW", "MINT", "LW")))
+  }
+  
+  # Ordering
+  toplot <- toplot %>%
+    mutate(Division = fct_relevel(Division, 
+                                  c("Insgesamt", "GSW", "MINT", "LW")))
+  
+  # Every second element to display
+  calls_to_display <- toplot %>% 
+    ungroup() %>% 
+    distinct(Call, CallEndDate) %>% 
+    arrange(CallEndDate) %>% 
+    pull(Call)
+  calls_to_display <- calls_to_display[seq(1, length(calls_to_display), 2)]
+  
+  # Translate
+  toplot <- toplot %>% 
+    mutate(Gender = case_when(Gender == "Female" ~ "Frauen", 
+                              Gender == "Male" ~ "Männer", 
+                              TRUE ~ "UNKNOWN"))
+  
+  
+  # Create the plot
+  p <- toplot %>%
+    ggplot(
+      mapping =
+        aes(
+          x = reorder(Call, CallEndDate), y = first_time, group = Gender, color = Gender,
+          tooltip = glue(
+            "<b>{Division}</b>, {Call}<br>",
+            "{round(100*first_time)}% {Gender}"
+          ),
+          data_id = rownames(.)
+        )
+    ) +
+    geom_line(size = 0.5) +
+    geom_point_interactive(size = 2) +
+    # expand_limits(x = c(-.5, length(unique(allpooled$Call)) + 1.5)) +
+    labs(title = title, x = xlab, y = ylab) +
+    scale_colour_manual(values = get_datastory_scheme(), "") +
+    scale_y_continuous(labels = scales::percent, limits = limits) +
+    get_datastory_theme(tick_axis = "x", gridline_axis = "y") +
+    scale_x_discrete(breaks = calls_to_display) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8),
+      axis.title.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10)
+    )
+  
+  # When we're plotting all divisions, we facet-wrap
+  if (div == "all") {
+    p <- p +
+      facet_wrap(~Division)
+  }
+  make_ggiraph(p)
+}
+
+# Function to plot OR trends over years
+plot_OR_trends <- function(model, number_years,
+                           dummy_variables = 1,
+                           ylab = "Odds Ratio",
+                           xlab = "Time", lwd = 2,
+                           ylim = c(0, 2), lty = 1, col = 1,
+                           axisticks = NULL, at = NULL,
+                           add = FALSE,
+                           print = TRUE, ci = FALSE,
+                           mixed = FALSE, title = NULL,
+                           cex.call = .75) {
+  # We first extract the design matrix from a model: valid for mixed and fixed
+  # effects models
+  design <-
+    stats::model.matrix(model)
+  
+  # However since we are only interested in the effect of GENDER, we only want
+  # X to include non-0 for the gender-column and the columns with the
+  # interactions of gender and year!
+  
+  # Now we create this dummy data to 'predict' from:
+  
+  # 1. we collect the spline columns:
+  dummydat_year_part <-
+    unique(design[, 2:(number_years)])
+  # start at 2, because we do not need the intercept.
+  
+  # 2.
+  # the first part of the dummy data matrix will only be zeros: the 'intercepts'
+  #         --> actual intercept + year effects
+  # and then we will add the default values of the variables
+  #      (1 for Gender, and 0 for all the others)
+  dummydat_first_with_vars <-
+    # To a matrix with only 0, the intercept and the year effects will not be 
+    # used...
+    cbind(matrix(0,
+                 ncol = number_years,
+                 nrow = nrow(dummydat_year_part)
+    ), dummy_variables[1])
+  # First variable, 'initializing' the matrix
+  # if there are more confounders used:
+  if (length(dummy_variables) > 1) {
+    for (i in 1:(length(dummy_variables) - 1)) {
+      dummydat_first_with_vars <-
+        cbind(dummydat_first_with_vars, dummy_variables[1 + i])
+    }
+  }
+  
+  # 3. Bind all the matrices, and add the year part at the end.
+  dummydat_all <- # this adds the time-gender-interaction terms at the end
+    cbind(dummydat_first_with_vars, dummydat_year_part)
+  # Only works like this because we are interested in GENDER == 1 == female!
+  # in the case of a continuous variable we would need to multiply the matrix
+  
+  # Then we extract the coefficient vector:
+  if (mixed) {
+    coefs <- fixef(model)
+  } else {
+    coefs <- coefficients(model)
+  }
+  # And compute the linear predictor : beta * X
+  linpred <- dummydat_all %*% coefs
+  or <- exp(linpred[, 1]) # Odds ratio
+  # Then the 95%-Wald confidence intervals are computed as:
+  if (ci) {
+    if (mixed) {
+      var_beta <- as.matrix(summary(model)$vcov)
+    } else {
+      var_beta <- summary(model)$cov.unscaled
+    }
+    se_linpred <- sapply(1:nrow(dummydat_all), function(i) {
+      sqrt(dummydat_all[i, ] %*% var_beta %*% dummydat_all[i, ])
+    })
+    # ci_or <- exp(data.frame(lower_limit = linpred - 2.55 * se_linpred,
+    #                         upper_limit = linpred + 2.55 * se_linpred))
+    ci_or <- exp(data.frame(
+      lower_limit = linpred - 1.96 * se_linpred,
+      upper_limit = linpred + 1.96 * se_linpred
+    ))
+  }
+  
+  # The print of the OR (together with the CI)
+  if (print) {
+    if (ci) {
+      print(data.frame(
+        lower_limit = ci_or$lower_limit,
+        or = exp(linpred[, 1]),
+        upper_limit = ci_or$upper_limit
+      ))
+    } else {
+      print(or)
+    }
+  }
+  
+  # The actual plot:
+  if (add) { # should the OR be added to an already existing plot?
+    lines(or, lty = lty, col = col, lwd = lwd)
+    if (ci) {
+      lines(ci_or$lower_limit, lty = 3, col = col, lwd = lwd)
+      lines(ci_or$upper_limit, lty = 3, col = col, lwd = lwd)
+    }
+  } else {
+    xaxt <- ifelse(is.null(axisticks), "s", "n") 
+    plot(or,
+         type = "b",
+         ylim = ylim, lty = lty, col = col,
+         ylab = ylab, xlab = xlab, xaxt = xaxt, lwd = lwd,
+         main = title
+    )
+    if (ci) {
+      lines(ci_or$lower_limit, lty = 3, col = col, lwd = lwd)
+      lines(ci_or$upper_limit, lty = 3, col = col, lwd = lwd)
+    }
+    abline(h = 1, lty = 2, col = "gray")
+    if (!is.null(axisticks)) {
+      axis(1, labels = FALSE, at = at, las = 2)
+      text(at, par("usr")[3] - 0.2,
+           labels = axisticks,
+           srt = 45, pos = 1, xpd = TRUE, cex = cex.call
+      )
+    }
+  }
+}
+```
+
+__Unterschiede zwischen den Erfolgsquoten von Frauen und Männern in der SNF-Förderung lassen sich durch vielfältige direkte und indirekte Einflüsse erklären. Ein Blick auf Störfaktoren, die das Ergebnis von Analysen verzerren können.__
+
+Als Institution, die sich für Chancengleichheit einsetzt, will der SNF Forschende mit unterschiedlichem Hintergrund unterstützen. Deshalb untersucht er mit regelmässigen Analysen den Einfluss, den das Geschlecht auf die Bewilligung und Finanzierung von Gesuchen im Rahmen seiner Projektförderung hat. Die Erfolgs- und Finanzierungsquoten und deren Zusammenhang mit dem Geschlecht wurden unter anderem mit Regressionsmodellen analysiert. Für eine treffende Interpretation dieser Analysen ist es wichtig, im Modell relevante Störfaktoren zu berücksichtigen. Denn die Schlussfolgerungen können markant anders ausfallen, wenn die Störfaktoren nicht korrekt modelliert werden.
+
+### Art der Institution, Erstgesuch und Alter der Gesuchstellenden
+
+Die <a href="https://data.snf.ch/stories/frauen-unterrepraesentiert-oder-unterfinanziert-de.html" target="_blank">erste Datengeschichte im Rahmen des SNF-Gender-Monitorings</a> präsentierte Zahlen zu den Erfolgsquoten von männlichen und weiblichen Gesuchstellenden. Diese unbereinigten Erfolgsquoten eignen sich jedoch nicht optimal zur Quantifizierung des Zusammenhangs zwischen Geschlecht und Fördererfolg. Zum Teil ist dies darauf zurückzuführen, dass für die Erfolgsquoten keine Störfaktoren berücksichtigt wurden. Möglich ist dies mit Regressionsmodellen, die wir entsprechend in dieser Analyse verwenden.
+
+
+<div class='info-box'>
+
+__Was ist ein Störfaktor?__
+
+Ein Störfaktor oder eine Störvariable ist ein Element, das einen Einfluss auf die Zielgrösse hat, die wir analysieren wollen (d.h. im vorliegenden Fall der Finanzierungsentscheid), aber auch auf die Variable, deren Einfluss wir zu interpretieren versuchen (d.h. das Geschlecht). Weshalb es wichtig ist, Störfaktoren zu berücksichtigen, lässt sich am Beispiel des Zusammenhangs zwischen Alkoholkonsum und Krebs zeigen. Es ist bekannt, dass Rauchen das Risiko für Lungenkrebs erhöht und dass Rauchen und Alkoholkonsum häufig stark korrelieren. Eine statistische Modellierung der Häufigkeit von Lungenkrebs unter Verwendung des Alkoholkonsums als einziger «erklärender Variable» würde ein hochsignifikantes Ergebnis liefern und somit fälschlicherweise darauf hindeuten, dass Alkoholkonsum Lungenkrebs «verursacht». Wenn jedoch zusätzlich der Störfaktor Rauchen/Nichtrauchen ins Modell einbezogen wird, verringern sich die statistische Signifikanz und der Einfluss von Alkohol auf Lungenkrebs massiv oder verschwinden sogar vollständig. Mit der Analyse von Störfaktoren lassen sich die richtigen und sinnvollen Zusammenhänge ermitteln und schätzen. Mit anderen Worten: Störfaktoren wirken sich sowohl auf den untersuchten Einflussfaktor als auch auf die Zielgrösse aus und können die Resultate des Modells stark verändern. Aus diesem Grund sollten Ergebnisse stets um Störfaktoren «bereinigt» sein, indem diese ins statistische Modell integriert werden.
+
+</div>
+
+Wir betrachten mehrere potenzielle Störfaktoren, d. h. Variablen, die sowohl mit dem Geschlecht als auch mit der Erfolgsquote von Gesuchen in der Projektförderung korrelieren. Ein Beispiel ist die Art der Institutionen, bei denen die Gesuchstellenden tätig sind. Die erste Abbildung unten zeigt den Anteil von Männern und Frauen bei den verantwortlichen Gesuchstellenden nach Art der Forschungsinstitution. Hier ist festzustellen, dass Forscherinnen häufiger von Fachhochschulen und Pädagogischen Hochschulen kommen als Forscher, die dafür häufiger bei Institutionen des ETH-Bereichs arbeiten. Gemäss früheren Analysen haben Gesuche von ETH-Institutionen eine höhere Chance, vom SNF gefördert zu werden. Die Art der Institution korreliert also sowohl mit der Erfolgsquote als auch mit dem Geschlecht der Gesuchstellenden. 
+
+Ausserdem ist aus früheren Analysen bekannt, dass Erstgesuche von Forschenden eine geringere Erfolgsquote haben als solche von Forschenden, die schon einmal ein Gesuch einreichten. Interne Analysen ergaben auch, dass die Erfolgsquote junger Gesuchstellender tendenziell tiefer ist. Die zweite Abbildung unten zeigt deutlich, dass der Anteil von Erstgesuchen bei den Frauen höher ist. Die Nichtberücksichtigung dieses Störfaktors kann daher die Ergebnisse eines statistischen Modells stark verzerren und die Auswirkungen des Geschlechts auf die Erfolgsquoten künstlich aufblähen oder verschleiern.
+
+
+```{r overall-sr, include=FALSE}
+# Function to create ggiraph object
+make_ggiraph <- function(ggobj) {
+  girafe(
+    ggobj = ggobj,
+    height_svg = 4,
+    options = list(
+      opts_toolbar(saveaspng = FALSE),
+      opts_hover(css = "fill:#ff0000;stroke:#000000;"),
+      opts_tooltip(
+        css = get_ggiraph_tooltip_css(),
+        opacity = 0.8,
+        delay_mouseover = 0,
+        delay_mouseout = 0
+      )
+    )
+  )
+}
+
+# Summarize female and male corr. applicant shares by insttution type
+plot_data <- data_gm_up_to_year_of_interest %>%
+  filter(!is.na(Call)) %>%
+  filter(Gender == "Female") %>%
+  group_by(Call, CallEndDate) %>%
+  mutate(N = n()) %>%
+  ungroup() %>%
+  group_by(InstType, Call, CallEndDate) %>%
+  summarise(perc = n() / head(N, 1)) %>%
+  ungroup() %>%
+  mutate(type = "Weibliche Gesuchstellende") %>%
+  bind_rows(data_gm_up_to_year_of_interest %>%
+              filter(!is.na(Call)) %>%
+              filter(Gender == "Male") %>%
+              group_by(Call, CallEndDate) %>%
+              mutate(N = n()) %>%
+              ungroup() %>%
+              group_by(InstType, Call, CallEndDate) %>%
+              summarise(perc = n() / head(N, 1)) %>%
+              ungroup() %>%
+              mutate(type = "Männliche Gesuchstellende")) %>% 
+  mutate(type = fct_relevel(type, 
+                            c("Weibliche Gesuchstellende", 
+                              "Männliche Gesuchstellende")))
+
+# Every second element to display
+calls_to_display <- plot_data %>% 
+  ungroup() %>% 
+  distinct(Call, CallEndDate) %>% 
+  arrange(CallEndDate) %>% 
+  pull(Call)
+calls_to_display <- calls_to_display[seq(1, length(calls_to_display), 2)]
+
+p0_female_male <- plot_data %>%
+  ggplot(aes(
+    x = reorder(Call, CallEndDate), y = perc, color = InstType, 
+    group = InstType,
+    tooltip = glue(
+      "<b>{InstType}</b>, {Call}<br>{round(100*perc)}%",
+      " {type}"
+    ), data_id = rownames(.)
+  )) +
+  geom_line(size = 0.5) +
+  geom_point_interactive(size = 2) +
+  expand_limits(x = c(-.5, length(unique(plot_data$Call)) + 1.5)) +
+  labs(x = NULL, y = "Anteil der Gesuchstellenden\n") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, .9)) +
+  scale_color_manual(values = get_datastory_scheme(), "") +
+  get_datastory_theme(gridline_axis = "y") +
+  scale_x_discrete(breaks = calls_to_display) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.direction = "horizontal"
+  ) +
+  facet_wrap(~type, nrow = 1)
+```
+
+```{r first-time, include=FALSE}
+allpooled_ft <- data_gm_up_to_year_of_interest %>%
+  filter(!is.na(Call)) %>%
+  group_by(Gender, Call, CallEndDate) %>%
+  summarise(first_time = mean(FirstProject == TRUE, na.rm = TRUE)) %>%
+  ungroup()
+
+toplot <- data_gm_up_to_year_of_interest %>%
+  filter(!is.na(Call)) %>%
+  group_by(Division, Gender, Call, CallEndDate) %>%
+  summarise(first_time = mean(FirstProject == TRUE, na.rm = TRUE))
+
+p1 <- plot_by_division(
+  div = "all", inverse_gender = TRUE,
+  title = NULL, xlab = NULL, limits = c(0, .5),
+  allpooled = allpooled_ft,
+  ylab = "Anteil Erstgesuche\n", add_overall = TRUE
+)
+```
+
+<div class="plot-box">
+
+<div class="hide-mobile hide-tablet widemedia">
+<div class="plot-title">Anteil der weiblichen und männlichen Gesuchstellenden nach Art der Institution im Zeitverlauf</div>
+```{r p0-desktop}
+make_ggiraph(p0_female_male)
+```
+<div class="caption">
+Anteil der weiblichen und männlichen verantwortlichen Gesuchstellenden nach Art der Institution von Oktober 2013 bis April 2022 in der Projektförderung des SNF (FH/PH: Fachhochschulen und Pädagogische Hochschulen).
+</div>
+<div class="plot-title">Anteil der weiblichen und männlichen Erstgesuchstellenden nach Forschungsbereichen im Zeitverlauf</div>
+```{r p1-desktop}
+p1
+```
+<div class="caption">
+Anteil der weiblichen und männlichen verantwortlichen Erstgesuchstellenden nach Forschungsbereich von Oktober 2013 bis April 2022 in der Projektförderung des SNF (GSW: Geistes- und Sozialwissenschaften, MINT: Mathematik, Informatik, Naturwissenschaften, Technik, LW: Lebenswissenschaften).
+</div>
+</div>
+
+<div class="hide-desktop">
+<div class="plot-title">Anteil der weiblichen und männlichen Gesuchstellenden nach Art der Institution im Zeitverlauf</div>
+```{r p0-mobile}
+make_ggiraph(p0_female_male)
+```
+<div class="caption">
+Anteil der weiblichen und männlichen verantwortlichen Gesuchstellenden nach Art der Institution von Oktober 2013 bis April 2022 in der Projektförderung des SNF (FH/PH: Fachhochschulen und Pädagogische Hochschulen).
+</div>
+<div class="plot-title">Anteil der weiblichen und männlichen Erstgesuchstellenden nach Forschungsbereichen im Zeitverlauf</div>
+```{r p1-mobile}
+p1
+```
+<div class="caption">
+Anteil der weiblichen und männlichen verantwortlichen Erstgesuchstellenden nach Forschungsbereich von Oktober 2013 bis April 2022 in der Projektförderung des SNF (GSW: Geistes- und Sozialwissenschaften, MINT: Mathematik, Informatik, Naturwissenschaften, Technik, LW: Lebenswissenschaften).
+</div>
+</div>
+</div>
+
+### Unbereinigte und bereinigte Resultate
+
+Zur Analyse der Erfolgsquoten nach Geschlecht modellieren wir daher die Förderentscheide auf der Ebene des einzelnen Gesuchs. Wir verwenden dazu logistische Regressionsmodelle für die binäre Zielvariable (bewilligt versus nicht bewilligt). Ein Regressionsmodell ist eine statistische Schätzung der Beziehung zwischen einer Zielvariablen und einer oder mehreren erklärenden Variablen. Bei der logistischen Regression ist die Zielvariable binär. Daraus resultiert keine direkte Schätzung für die Erfolgsquote, sondern ein Wert, der die Chance auf ein erfolgreiches Gesuch widerspiegelt. Die Wirkung der Faktoren, die die Erfolgschancen beeinflussen, wird dann mit dem Chancenverhältnis gemessen.
+
+<div class='info-box'>
+
+__Chancen, Chancenverhältnisse und Konfidenzintervalle__
+
+Eine Chance (englisch Odd) ist definiert als Wahrscheinlichkeit eines bestimmten Ereignisses, geteilt durch die Wahrscheinlichkeit, dass ein beliebiges Ereignis ausser dieses bestimmte Ereignis eintritt. Die Chance, mit einem Würfel eine Sechs zu würfeln, ist zum Beispiel 1/6 geteilt durch 5/6, also 1/5 (0,2). Das Chancenverhältnis (englisch Odds-Ratio) ist der Quotient zweier Chancen. Ein Beispiel: die Chance, eine Sechs zu würfeln, während man einen Glücksbringer trägt, geteilt durch die Chance, eine Sechs zu würfeln, ohne einen Glücksbringer zu tragen. Chancenverhältnisse können jeden Wert zwischen 0 und unendlich haben. Ein Chancenverhältnis von 1 bedeutet, dass beide Chancen gleich sind, d. h. dass der «untersuchte Faktor» keinen Einfluss auf die Eintretenswahrscheinlichkeit hat. Statistische Schätzungen wie das Chancenverhältnis werden zusammen mit einem Konfidenzintervall (KI) angegeben. Mit diesem Intervall wird quantifiziert, wie unsicher eine Schätzung ist. So ist das 95%-Konfidenzintervall der Bereich, in dem die Schätzung bei einer Wiederholung des Experiments in 95% der Fälle zu erwarten ist. Wenn ein Konfidenzintervall für ein Chancenverhältnis den Wert 1 enthält, gilt der geschätzte Effekt als statistisch nicht signifikant, während das Ergebnis als statistisch signifikant gilt, wenn das Intervall 1 nicht enthält.
+
+</div>
+
+In unserem Fall interessiert uns, ob die Erfolgschancen für weibliche und männliche Gesuchstellende unterschiedlich sind. Die in der nachstehenden Tabelle aufgeführten Chancenverhältnisse wurden anhand der beiden zuletzt ausgewerteten Ausschreibungen und für jeden Forschungsbereich getrennt berechnet. Bei den unbereinigten Versionen wurden Störfaktoren (Alter, Erstgesuch und Institutionsart) nicht berücksichtigt, bei den bereinigten wurden sie hingegen berücksichtigt. Beispielsweise beträgt das unbereinigte Chancenverhältnis für das Geschlecht (weiblich versus männlich) in den GSW 1,15, d. h. für Frauen ist die Chance, dass ihr Gesuch bewilligt wird, 1,15 Mal so hoch wie für männliche Gesuchstellende. Da das entsprechende 95%-Konfidenzintervall 1 enthält, ist dieser Geschlechter-Effekt jedoch statistisch nicht signifikant. In den beiden anderen Forschungsbereichen sind die Chancen auf Förderbeiträge für weibliche bzw. männliche Gesuchstellende in den nicht-bereinigten Modellen etwa gleich. Die bereinigten Chancenverhältnisse sind jedoch grösser als die unbereinigten, was darauf hindeutet, dass Gesuchstellerinnen nach der Bereinigung um Störfaktoren eine höhere Erfolgsquote haben als Gesuchsteller. Die beobachteten Effekte liegen allerdings alle in der Nähe von 1 (dem Wert des Chancenverhältnisses bei Chancengleichheit der Geschlechter) und sind statistisch nicht signifikant.
+
+```{r, include=FALSE, eval=FALSE}
+data_gm_up_to_year_of_interest %>%
+  count(IsApproved, Gender, FirstProject) %>%
+  group_by(FirstProject, Gender) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = FirstProject, y = prop, fill = Gender)) +
+  geom_col(position = position_dodge()) +
+  facet_wrap(~IsApproved, nrow = 2)
+
+data_gm_up_to_year_of_interest %>%
+  count(IsApproved, Gender, InstType) %>%
+  group_by(InstType, Gender) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = InstType, y = prop, fill = Gender)) +
+  geom_col(position = position_dodge()) +
+  facet_wrap(~IsApproved, nrow = 2)
+```
+
+
+<div class="plot-box">
+<div class="plot-title">Bereinigte und unbereinigte Gender-Odds-Ratio der weiblichen bzw. männlichen Gesuchstellenden (Konfidenzintervall: 95%) aus den logistischen Regressionsmodellen für die letzten beiden evaluierten Ausschreibungen der Projektförderung (Oktober 2021 und April 2022) nach Forschungsbereich</div>
+
+```{r}
+data_recent <- data_recent %>%
+  mutate(Gender = factor(Gender, levels = c("Male", "Female")))
+
+# Formula for computation of models for Odds ratio trends (adjusted)
+form <- sapply(
+  list(
+    confounders_odds_ssh,
+    confounders_odds_mint,
+    confounders_odds_ls
+  ),
+  function(conf) {
+    paste0("IsApproved ~ Gender + ", paste0(conf, collapse = " + "))
+  }
+)
+
+divisions <- c("GSW", "MINT", "LW")
+
+# Unadjusted model stratified by research area
+unadjusted_fit_recent <- lapply(1:3, function(i) {
+  data_subset <- data_recent %>%
+    filter(Division == divisions[i])
+  return(glm(IsApproved ~ Gender, family = "binomial", data = data_subset))
+})
+names(unadjusted_fit_recent) <- divisions
+
+# Adjusted model stratified by research area
+adjusted_fit_recent <- lapply(1:3, function(i) {
+  data_subset <- data_recent %>%
+    filter(Division == divisions[i])
+  return(glm(form[i], family = "binomial", data = data_subset))
+})
+names(adjusted_fit_recent) <- divisions
+
+# Put the results in nice tables:
+results_summary_table <- function(fit) {
+  tmp <-
+    data.frame(
+      Division = names(fit),
+      OR = format(exp(sapply(1:3, function(i) {
+        coefficients(fit[[i]])["GenderFemale"]
+      })),
+      digits = 2,
+      nsmall = 2
+      ),
+      CI = sapply(1:3, function(i) {
+        paste(
+          format(exp(confint(fit[[i]])["GenderFemale", 1]),
+                 digits = 2, nsmall = 2
+          ), "to",
+          format(exp(confint(fit[[i]])["GenderFemale", 2]),
+                 digits = 2, nsmall = 2
+          )
+        )
+      })
+    ) %>%
+    mutate(OR_CI = paste0(OR, " (", CI, ")")) %>%
+    select(Division, OR_CI)
+  return(tmp)
+}
+
+tokable <- as.data.frame(results_summary_table(unadjusted_fit_recent))
+tokable_adjusted <- as.data.frame(results_summary_table(adjusted_fit_recent))
+
+tokable %>%
+  left_join(tokable_adjusted, by = "Division") %>%
+  kable(
+    booktabs = TRUE,
+    col.names = c(
+      "Forschungsbereich", "Unbereinigte OR (95% KI)",
+      "Bereinigte OR (95% KI)"
+    ),
+    caption = ""
+  ) %>%
+  kable_styling(
+    position = "center",
+    htmltable_class = "lightable-striped",
+    html_font = "\"Source Sans Pro\""
+  ) %>%
+  kable_paper(
+    latex_options = c("striped", "hold_position"),
+    html_font = "\"Source Sans Pro\""
+  )
+```
+
+</div>
+
+Noch interessanter sind die nachstehenden Grafiken, die das Chancenverhältnis und das entsprechende 95%-Konfidenzintervall im Zeitverlauf für die einzelnen Forschungsbereiche zeigen (mit und ohne Berücksichtigung von Störfaktoren). Die Daten sind in dieser Analyse nach dem Entscheidjahr der Ausschreibung gruppiert. Es ist wichtig zu beachten, dass das Chancenverhältnis zwischen den Geschlechtern im Laufe der Zeit variiert. Gemäss den unbereinigten Chancenverhältnissen in GSW und LW waren die männlichen Gesuchstellenden in den meisten Jahren begünstigt. Hingegen zeigt das Chancenverhältnis in den MINT-Fächern zwar früher einen Vorteil für die Männer, im Laufe der Zeit dann aber einen Vorteil für Frauen. Nach der Bereinigung um Störfaktoren sehen diese Ergebnisse zum Teil anders aus. In den LW resultiert eine etwas weniger klare Begünstigung der männlichen Gesuchstellenden. Im MINT-Bereich erhalten wir die extremsten bereinigten Gender-Chancenverhältnisse: Das Chancenverhältnis beträgt 0,49 (95%-Konfidenzintervall von 0,29 bis 0,83) im Entscheidjahr 2015 und 1,58 (95%-Konfidenzintervall von 0,89 bis 2,80) im Entscheidjahr 2018. Insbesondere im Jahr 2015 können wir eine geschlechtsspezifische Verzerrung zuungunsten der Frauen nicht ausschliessen. Zusammenfassend ist festzuhalten, dass keine substanzielle Evidenz für eine geschlechtsspezifische Verzerrung (Gender Bias) in GSW und LW und eher schwache Evidenz für eine Verzerrung zugunsten von Männern im Entscheidjahr 2015 in MINT vorliegt.
+
+```{r prep_models_decision_year}
+# Recoding of levels for gender and code CallDecisionYear as factor variable
+data_gm_up_to_year_of_interest <- data_gm_up_to_year_of_interest %>%
+  mutate(
+    Gender = factor(Gender, levels = c("Male", "Female")),
+    CallDecisionYear = as.factor(CallDecisionYear)
+  )
+
+# Get number of decision years in the dataset
+n_years <- data_gm_up_to_year_of_interest %>%
+  pull(CallDecisionYear) %>%
+  nlevels()
+
+# Set some parameters for the plots
+ylim_OR_plot <- c(0.025, 3.0)
+axis_ticks_year <- levels(data_gm_up_to_year_of_interest$CallDecisionYear)
+ats_year <- 
+  seq(1, length(levels(data_gm_up_to_year_of_interest$CallDecisionYear)))
+```
+
+```{r models_mixed_unadj_decision_year, warning = FALSE, cache=FALSE}
+# Computation of models for odds ratio trends (unadjusted)
+all_unadjusted_div1_mixed_year <-
+  lme4::glmer(
+    IsApproved ~ CallDecisionYear * Gender +
+      (1 | ApplicantId_Masked),
+    family = "binomial",
+    data = subset(data_gm_up_to_year_of_interest,
+                  Division == "GSW"),
+    control = glmerControl(optimizer = "bobyqa",
+                           optCtrl = list(maxfun = 2e6))
+  )
+
+all_unadjusted_div2_mixed_year <-
+  lme4::glmer(
+    IsApproved ~ CallDecisionYear * Gender +
+      (1 | ApplicantId_Masked),
+    family = "binomial",
+    data = subset(data_gm_up_to_year_of_interest, Division == "MINT"),
+    control = glmerControl(optimizer = "bobyqa",
+                           optCtrl = list(maxfun = 2e6))
+  )
+
+all_unadjusted_div3_mixed_year <-
+  lme4::glmer(
+    IsApproved ~ CallDecisionYear * Gender +
+      (1 | ApplicantId_Masked),
+    family = "binomial",
+    data = subset(data_gm_up_to_year_of_interest,
+                  Division == "LW"),
+    control = glmerControl(optimizer = "bobyqa",
+                           optCtrl = list(maxfun = 2e6))
+  )
+
+# Plot the 4 OR plots with base R (...), either in mobile version (1 column) or
+# in desktop version (2 columns)
+plot_or_trends_1 <- function(vers = "desktop") {
+  mfrow_setting <- c(2, 2)
+  if (vers == "mobile") {
+    mfrow_setting <- c(3, 1)
+  }
+  
+  # Create and arrange the trend plots
+  par(mfrow = mfrow_setting, las = 2, mar = c(4, 4, 2, 1))
+  
+  plot_OR_trends(
+    model = all_unadjusted_div1_mixed_year,
+    dummy_variables = 1,
+    number_years = n_years,
+    ylim = ylim_OR_plot,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[2],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "GSW"
+  )
+  
+  plot_OR_trends(
+    model = all_unadjusted_div2_mixed_year,
+    dummy_variables = 1,
+    number_years = n_years,
+    ylim = ylim_OR_plot,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[1],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "MINT"
+  )
+  
+  plot_OR_trends(
+    model = all_unadjusted_div3_mixed_year,
+    dummy_variables = 1,
+    number_years = n_years,
+    ylim = ylim_OR_plot,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[4],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "LW"
+  )
+}
+```
+
+```{r models_mixed_adj_decision_year, warning = FALSE, message = FALSE, cache=FALSE}
+# Computation of models for odds ratio trends (adjusted)
+form <- sapply(
+  list(
+    confounders_odds_ssh,
+    confounders_odds_mint,
+    confounders_odds_ls
+  ),
+  function(conf) {
+    # The age variable has to be scaled to be included in the model
+    paste0(
+      "IsApproved ~ CallDecisionYear * Gender +",
+      paste0(conf, collapse = " + "),
+      " + (1 | ApplicantId_Masked)"
+    )
+  }
+)
+
+all_ext_adj_div1_mixed_year <-
+  lme4::glmer(form[1],
+              family = "binomial",
+              data = subset(data_gm_up_to_year_of_interest, Division == "GSW"),
+              control = glmerControl(
+                optimizer = "bobyqa",
+                optCtrl = list(maxfun = 2e6)
+              )
+  )
+
+all_ext_adj_div2_mixed_year <-
+  lme4::glmer(form[2],
+              family = "binomial",
+              data = subset(data_gm_up_to_year_of_interest, Division == "MINT"),
+              control = glmerControl(
+                optimizer = "bobyqa",
+                optCtrl = list(maxfun = 2e6)
+              )
+  )
+
+
+all_ext_adj_div3_mixed_year <-
+  lme4::glmer(form[3],
+              family = "binomial",
+              data = subset(data_gm_up_to_year_of_interest, Division == "LW"),
+              control = glmerControl(
+                optimizer = "bobyqa",
+                optCtrl = list(maxfun = 2e6)
+              )
+  )
+
+# Plot the 4 OR plots with base R (...), either in mobile version (1 column) or
+# in desktop version (2 columns)
+plot_or_trends_2 <- function(vers = "desktop") {
+  mfrow_setting <- c(2, 2)
+  if (vers == "mobile") {
+    mfrow_setting <- c(3, 1)
+  }
+  
+  # Plot the estimated odds ratio over time
+  par(mfrow = mfrow_setting, las = 2, mar = c(4, 4, 2, 1))
+  
+  dummy_variables_adj <- c(1, rep(0, 5))
+  
+  plot_OR_trends(
+    model = all_ext_adj_div1_mixed_year,
+    dummy_variables = dummy_variables_adj,
+    ylim = ylim_OR_plot,
+    number_years = n_years,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[2],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "GSW"
+  )
+  
+  plot_OR_trends(
+    model = all_ext_adj_div2_mixed_year,
+    dummy_variables = dummy_variables_adj,
+    ylim = ylim_OR_plot,
+    number_years = n_years,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[1],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "MINT"
+  )
+  
+  plot_OR_trends(
+    model = all_ext_adj_div3_mixed_year,
+    dummy_variables = dummy_variables_adj,
+    ylim = ylim_OR_plot,
+    number_years = n_years,
+    ylab = "Chancenverhältnis",
+    xlab = "",
+    axisticks = axis_ticks_year,
+    at = ats_year,
+    col = get_datastory_scheme()[4],
+    print = FALSE, mixed = TRUE, ci = TRUE,
+    title = "LW"
+  )
+}
+```
+
+<div class="hide-mobile hide-tablet widemedia">
+
+<div class="plot-box">
+<div class="plot-title">Unbereinigte geschlechtsspezifische Chancenverhältnisse von weiblichen und männlichen Gesuchstellenden im Zeitverlauf</div>
+
+```{r plot-OR-trends-unadj-desktop, cache=FALSE}
+# Show the graph for desktop
+plot_or_trends_1("desktop")
+```
+
+<div class="caption">
+Unbereinigte Gender-Chancenverhältnisse von weiblichen und männlichen Gesuchstellenden (KI 95 %) aus den gemischten logistischen Regressionsmodellen nach Forschungsbereich für die Entscheidjahre 2014-2022 in der Projektförderung des SNF. (Da etwa 50-65% der Gesuchstellenden pro Forschungsbereich in diesem Zeitraum mehrere Gesuche einreichten, enthält das Modell zur Berücksichtigung dieser Datenstruktur einen zufälligen Achsenabschnitt für die gesuchstellende Person.)
+</div>
+</div>
+
+<div class="plot-box">
+<div class="plot-title">Bereinigte Gender-Chancenverhältnisse für weibliche und männliche Gesuchstellende im Zeitverlauf</div>
+
+```{r plot-OR-trends-adj-desktop, cache=FALSE}
+# Show the graph for desktop
+plot_or_trends_2("desktop")
+```
+
+<div class="caption">
+Bereinigte Gender-Chancenverhältnisse für weibliche und männliche Gesuchstellende (KI: 95%) aus den gemischten logistischen Regressionsmodellen nach Forschungsbereich für die Entscheidjahre 2014-2022 in der Projektförderung des SNF. (Da etwa 50-65% der Gesuchstellenden pro Forschungsbereich in diesem Zeitraum mehrere Gesuche einreichten, enthält das Modell zur Berücksichtigung dieser Datenstruktur einen zufälligen Achsenabschnitt für die gesuchstellende Person.)
+</div>
+</div>
+
+</div>
+
+<div class="hide-desktop">
+
+<div class="plot-box">
+<div class="plot-title">Unbereinigte geschlechtsspezifische Chancenverhältnisse von weiblichen und männlichen Gesuchstellenden im Zeitverlauf</div>
+
+```{r plot-OR-trends-unadj-mobile, out.width="100%", out.height="100%", fig.height=9}
+# Show the graph for mobile
+plot_or_trends_1("mobile")
+```
+
+<div class="caption">
+Unbereinigte Gender-Chancenverhältnisse von weiblichen und männlichen Gesuchstellenden (KI 95 %) aus den gemischten logistischen Regressionsmodellen nach Forschungsbereich für die Entscheidjahre 2014-2022 in der Projektförderung des SNF. (Da etwa 50-65% der Gesuchstellenden pro Forschungsbereich in diesem Zeitraum mehrere Gesuche einreichten, enthält das Modell zur Berücksichtigung dieser Datenstruktur einen zufälligen Achsenabschnitt für die gesuchstellende Person.)
+</div>
+</div>
+
+<div class="plot-box">
+<div class="plot-title">Bereinigte Gender-Chancenverhältnisse für weibliche und männliche Gesuchstellende im Zeitverlauf</div>
+
+```{r plot-OR-trends-adj-mobile, out.width="100%", out.height="100%", fig.height=9}
+# Show the graph for desktop
+plot_or_trends_2("mobile")
+```
+
+<div class="caption">
+Bereinigte Gender-Chancenverhältnisse für weibliche und männliche Gesuchstellende (KI: 95%) aus den gemischten logistischen Regressionsmodellen nach Forschungsbereich für die Entscheidjahre 2014-2022 in der Projektförderung des SNF. (Da etwa 50-65% der Gesuchstellenden pro Forschungsbereich in diesem Zeitraum mehrere Gesuche einreichten, enthält das Modell zur Berücksichtigung dieser Datenstruktur einen zufälligen Achsenabschnitt für die gesuchstellende Person.)
+</div>
+</div>
+
+</div>
+
+Wir stellen also fest, dass die oben erwähnten Störfaktoren tatsächlich einen beträchtlichen Einfluss auf den beobachteten Geschlechtereffekt haben. In mehreren Fällen verändert sich die Grössenordnung der geschlechtsspezifischen Effekte, wenn sie um die Störfaktoren bereinigt werden.
+
+### SNF-Monitoring wird weitergeführt
+
+Bei den beiden jüngsten ausgewerteten Ausschreibungen gibt es keine statistische Evidenz für eine geschlechtsspezifische Verzerrung des Fördererfolgs in der Projektförderung, weder mit noch ohne Berücksichtigung der Störfaktoren. 
+Dennoch gab es bei gewissen früheren Ausschreibungen Hinweise auf eine solche Verzerrung zugunsten der Männer. Dies unterstreicht die Notwendigkeit eines sorgfältigen Gender-Monitorings, das die Eigenheiten der einzelnen Förderprogramme beachtet und alle relevanten Störfaktoren systematisch identifiziert und berücksichtigt. Im Rahmen des regelmässigen Gender-Monitorings untersucht der SNF neben den Förderbeiträgen, die weibliche und männliche Gesuchstellende erhalten, auch die Bewertungen der externen Gutachten und der internen Evaluationsgremien sowohl deskriptiv als auch mit Statistikmodellen. Diese Ergebnisse werden in einer späteren Datengeschichte der Serie «Gender-Monitoring» präsentiert.
+
+
+
+<div class="info-box">
+
+### Serie zum Gender Monitoring des SNF
+
+Der SNF analysiert systematisch die Anteile der Frauen und Männer in seinen Förderinstrumenten. Mit Hilfe dieses Gender Monitorings wollen wir unsere Auswahlverfahren und unser Angebot so weiterentwickeln, dass Frauen möglichst gleiche Chancen haben. In einer Serie stellen wir ausgewählte Daten vor und beleuchten unterschiedliche Aspekte.
+
+<a class="button-blue" href="https://data.snf.ch/stories/frauen-unterrepraesentiert-oder-unterfinanziert-de.html" target="_blank">Teil 1: So schneiden Frauen in der Projektförderung ab</a>
+
+<a class="button-blue" href="https://data.snf.ch/stories/je-hoeher-die-karrierestufe-desto-weniger-frauen-de.html" target="_blank">Teil 2: Je höher die Karrierestufe, desto weniger Frauen</a>
+
+<a class="button-blue" href="https://data.snf.ch/stories/der-einfluss-von-stoerfaktoren-de.html" target="_blank">Teil 3 (aktuell): Welchen Einfluss haben Störfaktoren?</a>
+
+</div>
+
+Daten, Text und Code dieser Datengeschichte sind <a href="https://github.com/snsf-data/datastory_gender_monitoring_confounders" target="_blank">auf Github verfügbar</a> und <a href="https://doi.org/10.46446/datastory.gender-monitoring-confounders" target="_blank">auf Zenodo archiviert</a>. DOI: 10.46446/datastory.gender-monitoring-confounders
